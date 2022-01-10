@@ -334,7 +334,7 @@ type scase struct {
 > + gc触发时间一般为2分钟一次以及手动触发(runtime.GC()) 
 > + gc性能优化思路之一： 减少对象分配的次数如对象复用或使用大对象组合小对象 sync.pool池就是其实现的案例之一  当对象过多需要反复创建时可以使用pool来复用对象优化gc
 >
-> 
+>
 
 #### 逃逸分析
 
@@ -383,9 +383,291 @@ type scase struct {
   ​
 
 
+## 第五章 并发控制
+
+#### WaitGroup
+
+> waitGroup结构体
+
+```go
+type WaitGroup struct {
+  statel [3]uint32
+}
+statel是一个长度为3的数组， 包含了state和一个信号量， state实际上是两个计数器
+counter: 当前还未执行结束的goroutine计数器
+waiter count:等待goroutine-group结束的goroutine数量， 既有多少个等待者
+semaphore：信号量
+```
+
+> waitGroup对外开放了三个方法
+>
+> + Add(delta int):将delta值加到counter中（delta可为负值）
+> + Wait():waiter递增1，并阻塞等待信号量semaphore
+> + Done():counter递减1， 按照waiter数值释放相应次数的信号量（Done()==Add(-1))
+>
+> Add(int) ->  counter == 0 ?  |  N -> return
+>
+> ​						|  Y -> for ; waiter !=0; waiter-- {runtime_Semrelease(semap, false)}(发送信号量唤醒)
+>
+> Wait() -> waiter++ -> runtime_Semrecquire(semap)(等到被唤醒)
+
+> waitGroup 源码实现 使用逻辑运算uint64前32位表示waiter的数量 后32位表示counter的数量->bitmap实现方式
+
+> 使用管道传递信号实现 单单通过判断counter的数量后循环查询counter的数值也可以实现 对比？
+
+#### context
+
+> 接口定义
+
+```go
+type Context interface {
+  Deadline() (deadline time.Time, ok bool)// 返回deadline和是否已设置deadline的标识 默认为false
+  Done() <-chan struct{}// 返回一个探测Context是否取消的channel， 当Context取消时会自动将该channel关闭
+  Err() error // 返回context关闭的原因
+  Value(key interface{}) interface{}// 用于在goroutine中传值
+}
+```
+
+> 空context-> emptyCtx 空的context本身不包含任何值仅用于其他context的父节点
+>
+> type emptyCtx int
+>
+> context包中定义了一个公用的emptyCtx全局变量-> backgroud 可以使用context.Background()获取
+
+> context提供了四个不同类型的context，使用这四个方法如果没有父节点需要传入background,即将background作为父节点
+
++ WithCancel()
++ WithDeadline()
++ WithTimeout()
++ WithValue()
+
+>interface Context | struct emptyCtx 
+>
+>​				| struct cancelCtx| WithCancel()
+>
+>​				| struct valueCtx  | WithValue()
+>
+>​				| struct timerCtx | WithTimeout()
+>
+>​							       | WithDeadline()
+
+> cancelCtx
+
+```go
+type cancelCtx struct {
+  Context
+  
+  mu sync.Mutex
+  done chan struct{}
+  children map[canceler]struct // 记录所有由此context派生的child（派生！= 传递）
+  err error // 记录错误的类型
+}
+cancelCtx与deadline和value无关， 只需要实现Done() 和 Err() 外露接口即可
+```
+
++ Done() 接口实现 只需返回cancelCtx.done即可(第一个done()未初始化，所以需要作判断进行初始化操作--cancelCtx没有初始化函数)
+
+  + ```go
+    func (c *cancelCtx)Done() <-chan struct{} {
+      c.mu.Lock()
+      if c.done == nil {
+        c.done = make(chan struct{}) // no_cache_channel 管道关闭时所有监听该管道都会得到关闭管道的信号
+        d := c.done
+        c.mu.Unlock()
+        return d
+      }
+    }
+    ```
+
++ Cancel() 方法实现伪代码
+
+  + ```go
+    func (c *cancelCtx) cancel(removeFromParent bool, err error) {
+      c.mu.Lock()
+      c.err = err
+      close(c.done) // 关闭所有传递的ctx
+      
+      for child := range c.children {
+        child.cancel(fasle, err) // 关闭派生child
+      }
+      c.children = nil 
+      c.mu.Unlock()
+      
+      if removeFromParent {
+        removeChild(c.Context, c) // 将自己从父节点移除
+      }
+    }
+    ```
+
+  + ```go
+    example 1:
+    func TestWithCancelContext(t *testing.T) {
+    	ctx, _ := context.WithCancel(context.Background())
+    	ctx2, cancelFunc := context.WithCancel(ctx)
+    	go func(ctx context.Context) {
+    		select {
+    		case <- ctx.Done():
+    			fmt.Println("p ctx")
+    		}
+    	}(ctx)
+
+    	go func(ctx context.Context) {
+    		select {
+    		case <- ctx.Done():
+    			fmt.Println("c ctx")
+    		}
+    	}(ctx2)
+
+    	cancelFunc()
+    	for {
+    		time.Sleep(time.Second * 100)
+    	}
+    }
+    result：c ctx
+
+    example 2:
+    func TestWithCancelContext(t *testing.T) {
+    	ctx, cancelFunc := context.WithCancel(context.Background())
+    	ctx2, _ := context.WithCancel(ctx)
+    	go func(ctx context.Context) {
+    		select {
+    		case <- ctx.Done():
+    			fmt.Println("p ctx")
+    		}
+    	}(ctx)
+
+    	go func(ctx context.Context) {
+    		select {
+    		case <- ctx.Done():
+    			fmt.Println("c ctx")
+    		}
+    	}(ctx2)
+
+    	cancelFunc()
+    	for {
+    		time.Sleep(time.Second * 100)
+    	}
+    }
+    result：p ctx
+    ```
+
+> WithCancel() 方法的实现
+
++ 初始化一个cancelCtx实例
+
++ 将cancelCtx实例添加到其父节点的children中（如果父节点也可以被“cancel”）
+
++ 返回cancelCtx实例和cancel()方法
+
++ 实现源码
+
+  + ```go
+    func WithCancel(parent Context) (ctx Context, cancel CancelFunc) {
+      c := newCancelCtx(parent)
+      propagateCancel(parent, &c)
+      return &c, func() {c.cancel(true, Canceled)}
+    }
+    ```
+
++ 将自身添加到父节点的过程
+
+  + 如果父节点也支持cancel， 也就是说其父节点肯定有children成员， 那么把新context添加到children中即可
+  + 如果父节点不支持cancel， 就继续向上查询， 知道找到一个支持cancel的节点， 把新context添加到children中
+  + 如果所有的父节点均不支持cancel， 则启动一个协程等待父节点结束， 再把当前context结束
+
+> timerCtx
+
+```go
+type timerCtx struct {
+  cancelCtx
+  timer *time.Timer
+  deadline time.Time
+}
+```
+
+>  withDeadLine()方法的实现
+
++ 初始化一个timerCtx实例
++ 将timerCtx实例添加到其父节点的children中（如果父节点也可以被“cancel”)
++ 启动定时器， 定时器到期后会自动“cancel” 本context
++ 返回timerCtx实例和cancel（）方法
+
+> withTimeout()方法的实现
+
+```go
+func WithTimeout(parent Context, timeout time.Druation)(Context, CancelFunc){
+  return WithDeadLine(parent, time.Now().Add(timeout))
+}
+```
+
+> valueCtx
+
+```go
+type valueCtx struct {
+  Context
+  key, val interface{} // 没有实现Cancel() Err()
+}
+当前context查找不到key时， 会向父节点查找， 如果查询不到则最终返回interface{}, 也就是说可以通过context查询到父节点的value值
+```
+
+> 典型使用案例
+
+```go
+func HandelRequest(ctx context.Context) {
+  for {
+    select {
+      case <- ctx.Done(): // 永远无法返回， 需要返回的话 需要在创建时指定可以cancel()的context作为parent 如下 "这样才有效" 
+      default:
+      fmt.Println("HandelRequest runnint, parameter:", ctx.Value("parameter"))
+    }
+  }
+}
+func main() {
+  var ctxx, cancel := context.WithCancel(context.Background) // 这样
+   ctx := context.WithValue(ctxx, "parameter", 1) // 才
+  cancel() // 有效
+  ctx := context.WithValue(context.Background(), "parameter", 1)
+  go HandelRequest(ctx)
+  select {}
+}
+```
+
+## Mutex
+
+> 结构体
+
+```go
+type Mutex struct {
+  state int32 // 一分为四 waiter 29bit| starving 1bit| woken 1bit| locked 1bit
+  sema uint32 // 标识信号量
+}
+locked 1 表示加锁| 0 未加锁
+woken 有协程自旋等待加锁时置为1 用于起到有协程解锁时无需释放信号量 直接为自旋协程加锁
+starving normal正常模式（可以有自旋）| straving 饥饿模式（不可有自旋）
+waiter 等待加锁的协程（用于释放信号量告知协程可以抢锁了）
+```
+
+> 自旋
+
+> RWMutex
+
++ 写操作是如何阻止写操作的
+
+  > 读写锁包含一个互斥锁，谁拿到锁谁写
+
++ 写操作是如何阻止读操作的
+
+  > 读操作维持着一个readerCount的计数，理论上最大为2的30次方个。写操作时将readerCount-理论上最大的数，得到一个负值，当有读锁定来时检测到为负值便知道有写操作在进行，阻塞。而真实得读操作个数并不会丢失，只需要将readerCount加上理论上最大的个数即可。
+
++ 读操作是如何组织写操作的
+
+  > 读锁定会将readerCount的计数加一， 即readerCount的值大于零时，写锁定便知道有读锁定在进行
+
++ 为什么写锁定不会被 “饿死”
+
+  > 如果有读锁定在进行，然后一直陆陆续续有读锁定进来，那么写锁定不是一直等不到读锁定释放被饿死吗？这种情况不会发生的。当写锁定来时会维护一个readerWait的计数。会将readerCount的值复制到readerWait的值中，然后每一个读锁定解锁readerWait和readerCount就会减一，当readerWait为0时就会唤醒写锁定进行锁定。这样写锁定就不会饿死，并且还能维持readerCount中读锁定的计数。当写锁定完成后就去唤醒读锁定。
 
 
-#### 
 
 
 
